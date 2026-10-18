@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 # Unbuffered stdout so container logs appear in CloudWatch as they happen rather
 # than when the buffer flushes.
