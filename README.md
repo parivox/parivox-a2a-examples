@@ -1,5 +1,7 @@
 # parivox-a2a-examples
 
+[![ci](https://github.com/parivox/parivox-a2a-examples/actions/workflows/ci.yml/badge.svg)](https://github.com/parivox/parivox-a2a-examples/actions/workflows/ci.yml)
+
 Reference [A2A](https://a2a-protocol.org) agents that Parivox agents can delegate work to.
 
 Each agent in this repository is an independent, self-contained A2A server: it publishes
@@ -114,6 +116,10 @@ lower than the enforced result.
 
 The setup described below reflects Parivox's deployment architecture as an example; modify and adapt it as needed for your own infrastructure requirements.
 
+The deploy workflow is inert in this repository: it runs only when started by hand in a
+repository that has opted in. [**Deploying an agent to AWS**](docs/deploying.md) covers the
+OIDC role, secrets and GitHub environment it needs.
+
 Each agent has its own CloudFormation stack under `infra/` and deploys as a single-replica
 ECS Fargate service, discoverable through AWS Cloud Map private DNS.
 
@@ -129,7 +135,7 @@ Two constraints are deliberate and load-bearing:
 
 ## Security
 
-Report vulnerabilities privately to the repository owners. Do not commit credentials,
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md). Do not commit credentials,
 account identifiers, ARNs, or internal hostnames — CI runs `gitleaks` on every push, and a
 credential that lands in history is not fixable by a follow-up commit.
 

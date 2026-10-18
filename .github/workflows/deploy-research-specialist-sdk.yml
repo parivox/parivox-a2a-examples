@@ -1,10 +1,19 @@
 name: deploy-research-specialist-sdk
 
+# An example deployment, inert by default. It never runs on its own: it is
+# started by hand, and only in a repository that has opted in by setting the
+# DEPLOY_ENABLED variable and an `aws-production` environment. This repository
+# sets neither. See docs/deploying.md for the AWS side.
+#
+# Chaining a deploy to CI with `workflow_run` is a common pattern and a common
+# hole: for a fork pull request, `workflow_run.head_branch` is the *fork's*
+# branch name, so a check on `head_branch == 'main'` alone lets a fork's code
+# deploy with your cloud role. If you add that trigger, also require
+# `workflow_run.event == 'push'` and
+# `workflow_run.head_repository.full_name == github.repository`.
+
 on:
   workflow_dispatch:
-  workflow_run:
-    workflows: ["ci"]
-    types: [completed]
 
 permissions:
   contents: read
@@ -21,53 +30,55 @@ env:
 
 jobs:
   deploy:
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository)
+    if: vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
+    # Required reviewers and a main-only branch rule belong on this environment,
+    # and the AWS role's OIDC trust policy should name it in its `sub` condition.
+    environment: aws-production
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
-      SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      SOURCE_SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Validate deploy configuration
+        # Account-identifying values are stored as environment *secrets*, not
+        # variables, even though none of them is a credential. GitHub prints every
+        # step's environment and the expanded command text in the job log; only
+        # secrets are masked there, and on a public repository that log is public.
         run: |
           set -euo pipefail
           missing=false
-          # Account-identifying values live in repository variables, never in the
-          # tree: this repository is written to be publishable.
-          for name in AWS_REGION A2A_VPC_ID A2A_SUBNET_IDS A2A_CLIENT_SECURITY_GROUP_ID \
-                      A2A_RESEARCH_SDK_API_KEY_SECRET_ARN; do
+          for name in AWS_REGION AWS_ROLE_TO_ASSUME A2A_VPC_ID A2A_SUBNET_IDS \
+                      A2A_CLIENT_SECURITY_GROUP_ID A2A_RESEARCH_SDK_API_KEY_SECRET_ARN; do
             eval "value=\${$name:-}"
             if [ -z "$value" ]; then
-              echo "::error::Missing required repository variable: $name"
+              echo "::error::Missing required setting: $name"
               missing=true
             fi
           done
-          if [ -z "${AWS_ROLE_TO_ASSUME:-}" ]; then
-            echo "::error::Missing required secret: AWS_ROLE_TO_ASSUME"
-            missing=true
-          fi
           [ "$missing" = "false" ]
         env:
-          AWS_REGION: ${{ vars.AWS_REGION }}
-          A2A_VPC_ID: ${{ vars.A2A_VPC_ID }}
-          A2A_SUBNET_IDS: ${{ vars.A2A_SUBNET_IDS }}
-          A2A_CLIENT_SECURITY_GROUP_ID: ${{ vars.A2A_CLIENT_SECURITY_GROUP_ID }}
-          A2A_RESEARCH_SDK_API_KEY_SECRET_ARN: ${{ vars.A2A_RESEARCH_SDK_API_KEY_SECRET_ARN }}
           AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          A2A_VPC_ID: ${{ secrets.A2A_VPC_ID }}
+          A2A_SUBNET_IDS: ${{ secrets.A2A_SUBNET_IDS }}
+          A2A_CLIENT_SECURITY_GROUP_ID: ${{ secrets.A2A_CLIENT_SECURITY_GROUP_ID }}
+          A2A_RESEARCH_SDK_API_KEY_SECRET_ARN: ${{ secrets.A2A_RESEARCH_SDK_API_KEY_SECRET_ARN }}
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Mask the AWS account ID
+        # The ECR registry hostname, every image URI and the stack outputs contain
+        # the account ID. Read it at runtime so it never appears in the command
+        # text, and mask it before any later step can print it.
+        run: |
+          set -euo pipefail
+          account="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::${account}"
 
       - name: Ensure ECR repository exists
         # The repository is not part of the stack: the stack needs an image URI to
@@ -82,19 +93,20 @@ jobs:
 
       - name: Login to Amazon ECR
         id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
       - name: Build and push image
         id: image
         run: |
           set -euo pipefail
-          registry="${{ steps.ecr-login.outputs.registry }}"
           tag="${SOURCE_SHA:0:7}"
-          uri="${registry}/${ECR_REPOSITORY}"
+          uri="${REGISTRY}/${ECR_REPOSITORY}"
           docker build -t "${uri}:${tag}" -t "${uri}:latest" "$AGENT_DIR"
           docker push "${uri}:${tag}"
           docker push "${uri}:latest"
           echo "uri=${uri}:${tag}" >> "$GITHUB_OUTPUT"
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
 
       - name: Deploy stack
         run: |
@@ -106,25 +118,31 @@ jobs:
             --no-fail-on-empty-changeset \
             --parameter-overrides \
               ServiceName="$STACK_NAME" \
-              VpcId="${{ vars.A2A_VPC_ID }}" \
-              SubnetIds="${{ vars.A2A_SUBNET_IDS }}" \
-              ClientSecurityGroupId="${{ vars.A2A_CLIENT_SECURITY_GROUP_ID }}" \
-              ContainerImageUri="${{ steps.image.outputs.uri }}" \
-              ApiKeySecretArn="${{ vars.A2A_RESEARCH_SDK_API_KEY_SECRET_ARN }}" \
-              OpenAiSecretArn="${{ vars.A2A_RESEARCH_SDK_OPENAI_SECRET_ARN }}"
+              VpcId="$A2A_VPC_ID" \
+              SubnetIds="$A2A_SUBNET_IDS" \
+              ClientSecurityGroupId="$A2A_CLIENT_SECURITY_GROUP_ID" \
+              ContainerImageUri="$IMAGE_URI" \
+              ApiKeySecretArn="$A2A_RESEARCH_SDK_API_KEY_SECRET_ARN" \
+              OpenAiSecretArn="$A2A_RESEARCH_SDK_OPENAI_SECRET_ARN"
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
+          A2A_VPC_ID: ${{ secrets.A2A_VPC_ID }}
+          A2A_SUBNET_IDS: ${{ secrets.A2A_SUBNET_IDS }}
+          A2A_CLIENT_SECURITY_GROUP_ID: ${{ secrets.A2A_CLIENT_SECURITY_GROUP_ID }}
+          A2A_RESEARCH_SDK_API_KEY_SECRET_ARN: ${{ secrets.A2A_RESEARCH_SDK_API_KEY_SECRET_ARN }}
+          A2A_RESEARCH_SDK_OPENAI_SECRET_ARN: ${{ secrets.A2A_RESEARCH_SDK_OPENAI_SECRET_ARN }}
 
       - name: Verify the deployed task definition
         # A green deploy is not proof that the intended configuration landed:
         # verify against the task definition ECS actually runs.
         run: |
           set -euo pipefail
-          expected="${{ steps.image.outputs.uri }}"
           actual="$(aws ecs describe-task-definition \
             --task-definition "$STACK_NAME" \
             --query 'taskDefinition.containerDefinitions[0].image' --output text)"
-          echo "expected image: $expected"
+          echo "expected image: $IMAGE_URI"
           echo "deployed image: $actual"
-          if [ "$expected" != "$actual" ]; then
+          if [ "$IMAGE_URI" != "$actual" ]; then
             echo "::error::Deployed task definition does not reference the image just built."
             exit 1
           fi
@@ -137,12 +155,9 @@ jobs:
           open="$(aws ec2 describe-security-groups --group-ids "$sg" \
             --query 'SecurityGroups[0].IpPermissions[].IpRanges[].CidrIp' --output text)"
           if [ -n "$open" ]; then
-            echo "::error::Service security group $sg has CIDR ingress ($open); it must admit only the client security group."
+            echo "::error::Service security group has CIDR ingress ($open); it must admit only the client security group."
             exit 1
           fi
           echo "Ingress is restricted to security-group sources only."
-
-      - name: Report endpoint
-        run: |
-          aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-            --query "Stacks[0].Outputs[?OutputKey=='RpcUrl'].OutputValue | [0]" --output text
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.uri }}
